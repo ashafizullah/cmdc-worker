@@ -1,7 +1,10 @@
 export type RunStatus = 'idle' | 'running' | 'done' | 'failed' | 'stopped'
 
-/** Token counts; `input` includes the cached part, `cacheRead`. */
-export type Tokens = { input: number; output: number; cacheRead: number }
+/**
+ * Token counts summed over model requests; `input` includes the cached part, `cacheRead`.
+ * `context` is the last request's input, the size of the context it sent.
+ */
+export type Tokens = { input: number; output: number; cacheRead: number; context?: number }
 
 export type Run = {
   status: RunStatus

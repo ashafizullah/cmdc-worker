@@ -52,9 +52,10 @@ test('parses cmdc events into log lines', async () => {
   expect(parseLine(JSON.stringify({ type: 'event', event: { type: 'tool_queued', toolName: 'bash', input: { command: 'pnpm test' } } })).lines)
     .toEqual(['▸ bash pnpm test'])
   const end = parseLine(JSON.stringify({ type: 'event', event: { type: 'model_request_end', model: 'm', usage: { inputTokens: 5, outputTokens: 2, cacheReadTokens: 3 } } }))
-  expect(end.usage).toEqual({ input: 5, output: 2, cacheRead: 3 })
+  expect(end.usage).toEqual({ input: 5, output: 2, cacheRead: 3, context: 5 })
   expect(parseLine(JSON.stringify({ type: 'event', event: { type: 'turn_end', usage: { inputTokens: 5 } } })).usage).toBeUndefined()
-  expect(formatTokens({ input: 4_400_000, output: 36_874, cacheRead: 4_224_000 })).toBe('↑4.4M (96% cached) ↓37k')
+  expect(formatTokens({ input: 4_400_000, output: 36_874, cacheRead: 4_224_000, context: 120_000 })).toBe('↑176k new + 4.2M cached · ctx 120k ↓37k')
+  expect(formatTokens({ input: 900, output: 5, cacheRead: 0 })).toBe('↑900 new ↓5')
   expect(formatMs(802_000)).toBe('13m22s')
   expect(parseLine(JSON.stringify({ type: 'event', event: { type: 'run_start', sessionId: 'x' } })).sessionId).toBe('x')
   expect(splitLines('a\nb\npar')).toEqual({ complete: ['a', 'b'], rest: 'par' })
@@ -83,7 +84,7 @@ test('runs cmdc, then resumes its session for fixes', async ($, on) => {
   expect(report).toContain('?? src/a.ts')
   expect(spawned[0]).toContain('--yolo')
   expect(spawned[0]).not.toContain('--session')
-  expect(report).toContain('This run: 1 turns, ↑1.0k (80% cached) ↓20 tokens.')
+  expect(report).toContain('This run: 1 turns, ↑200 new + 800 cached · ctx 1.0k ↓20 tokens.')
   expect(report).toContain('Job so far (1 run): cmdc')
   expect(report).toContain('+new file')
   // The diff spans the trees written before and after the run.
@@ -92,7 +93,7 @@ test('runs cmdc, then resumes its session for fixes', async ($, on) => {
   const second = String((await $.tool.call({ tool: TOOL, task: 'Rename a.ts to b.ts', resume: true } as never)).result)
   expect(spawned[1]?.slice(-2)).toEqual(['--session', 'sess-1'])
   expect(second).toContain('Job so far (2 runs)')
-  expect(second).toContain('↑2.0k (80% cached) ↓40')
+  expect(second).toContain('↑400 new + 1.6k cached · ctx 1.0k ↓40')
 })
 
 test('the pane shows the job: cmdc and Claude figures and each run', async ($, on) => {
@@ -100,7 +101,7 @@ test('the pane shows the job: cmdc and Claude figures and each run', async ($, o
   await $.tool.call({ tool: TOOL, task: 'Add a.ts' } as never)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'cmdc-worker', surface, component: 'Pane', requestId: 'cmdc-worker', props: { title: 'cmdc worker', isFocused: false, bodyColumns: 120 } } as never)
-    expect(await ui.find({ type: 'Text', text: /cmdc.*↑1\.0k \(80% cached\) ↓20/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /cmdc.*↑200 new \+ 800 cached · ctx 1\.0k ↓20/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /Claude.*\$0\.00/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /1\. task ✓ .* 1 turns/ })).toBeDefined()
     await ui.unmount()

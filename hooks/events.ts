@@ -18,21 +18,27 @@ export type Parsed = {
   model?: string
 }
 
-export const NO_TOKENS: Tokens = { input: 0, output: 0, cacheRead: 0 }
+export const NO_TOKENS: Tokens = { input: 0, output: 0, cacheRead: 0, context: 0 }
 
+/** Sums the counts; `context` is the later one's, as each request resends the whole context. */
 export const addTokens = (a: Tokens, b: Tokens): Tokens => ({
   input: a.input + b.input,
   output: a.output + b.output,
   cacheRead: a.cacheRead + b.cacheRead,
+  context: b.context || a.context || 0,
 })
 
 const count = (n: number) =>
   n < 1000 ? String(n) : n < 1_000_000 ? `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k` : `${(n / 1_000_000).toFixed(1)}M`
 
-/** `↑4.4M (96% cached) ↓37k`. */
+/**
+ * `↑176k new + 4.2M cached · ctx 120k ↓37k`: input split into uncached and cache reads
+ * (summed over requests), then the last request's context size.
+ */
 export function formatTokens(t: Tokens): string {
-  const cached = t.input > 0 && t.cacheRead > 0 ? ` (${Math.round((t.cacheRead / t.input) * 100)}% cached)` : ''
-  return `↑${count(t.input)}${cached} ↓${count(t.output)}`
+  const cached = t.cacheRead > 0 ? ` + ${count(t.cacheRead)} cached` : ''
+  const context = t.context ? ` · ctx ${count(t.context)}` : ''
+  return `↑${count(Math.max(0, t.input - t.cacheRead))} new${cached}${context} ↓${count(t.output)}`
 }
 
 export function formatMs(ms: number): string {
@@ -88,7 +94,7 @@ export function parseLine(raw: string): Parsed {
     }
     case 'model_request_end': {
       const u = ev.usage as Partial<Record<'inputTokens' | 'outputTokens' | 'cacheReadTokens', number>> | undefined
-      const usage = u && { input: u.inputTokens ?? 0, output: u.outputTokens ?? 0, cacheRead: u.cacheReadTokens ?? 0 }
+      const usage = u && { input: u.inputTokens ?? 0, output: u.outputTokens ?? 0, cacheRead: u.cacheReadTokens ?? 0, context: u.inputTokens ?? 0 }
       return { lines: [], usage, model: typeof ev.model === 'string' ? ev.model : undefined }
     }
     case 'tool_completed': {

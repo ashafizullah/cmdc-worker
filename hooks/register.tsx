@@ -57,11 +57,10 @@ async function snapshot($: EngineInterface, cwd: string): Promise<string | undef
 
 const elapsed = (from?: number, to?: number) => (from === undefined ? '' : formatMs((to ?? Date.now()) - from))
 
-const tokensOf = (u: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }): Tokens => ({
-  input: u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens,
-  output: u.output_tokens,
-  cacheRead: u.cache_read_input_tokens,
-})
+const tokensOf = (u: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }): Tokens => {
+  const input = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+  return { input, output: u.output_tokens, cacheRead: u.cache_read_input_tokens, context: input }
+}
 
 async function sessionUsd($: EngineInterface): Promise<number> {
   try {
