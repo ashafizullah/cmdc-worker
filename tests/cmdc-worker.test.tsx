@@ -107,3 +107,46 @@ test('the pane shows the job: cmdc and Claude figures and each run', async ($, o
     await ui.unmount()
   }
 })
+
+function claudeSteps($: Parameters<Parameters<typeof test>[1]>[0], on: On) {
+  let usd = 0
+  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [], cost: { usd } } }) as never)
+  on('turn.step', async function* (_, e) {
+    const input = e.agentId ? 10_000 : 100
+    usd += e.agentId ? 1 : 0.01
+    const usage = { input_tokens: input, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'm' }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
+  })
+  return async (turnId: string, agentId?: string) => {
+    const stream = $.turn.step({ turnId, index: 0, model: 'm', messageCount: 1, ...(agentId ? { agentId } : {}) })
+    for await (const _ of stream);
+    return stream.result
+  }
+}
+
+const claudeLine = async ($: Parameters<Parameters<typeof test>[1]>[0], text: RegExp) => {
+  const ui = await $.ui.mount({ plugin: 'cmdc-worker', surface: 'terminal', component: 'Pane', requestId: 'cmdc-worker', props: { title: 'cmdc worker', isFocused: false, bodyColumns: 120 } } as never)
+  const found = await ui.find({ type: 'Text', text })
+  await ui.unmount()
+  return found
+}
+
+test("Claude's figures count the planning before the call and the review after it", async ($, on) => {
+  world(on)
+  const step = claudeSteps($, on)
+  await step('t1')
+  await $.tool.call({ tool: TOOL, task: 'Add a.ts' } as never)
+  await step('t1')
+  expect(await claudeLine($, /Claude.*↑200 new · ctx 100 ↓2 · \$0\.02/)).toBeDefined()
+})
+
+test("Claude's figures count only the loop that called cmdc, and flag a shared cost", async ($, on) => {
+  world(on)
+  const step = claudeSteps($, on)
+  await step('t1')
+  await step('s1', 'sub-1')
+  await $.tool.call({ tool: TOOL, task: 'Add a.ts' } as never)
+  await step('s1', 'sub-1')
+  await step('t1')
+  expect(await claudeLine($, /Claude.*↑200 new · ctx 100 ↓2 · \$\?/)).toBeDefined()
+})

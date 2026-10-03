@@ -74,12 +74,18 @@ async function sessionUsd($: EngineInterface): Promise<number> {
 let current: AsyncIterator<unknown> | undefined
 // Spins the pane's spinner while a run is going.
 let ticker: Timer | undefined
-// Claude's model steps in the current main turn, so a job started mid-turn counts the planning before it.
-let mainTurn: string | undefined
-let turnSteps = { ms: 0, tokens: NO_TOKENS }
-let turnStartUsd = 0
-// The session cost when Claude's side of the job was last counted.
+type Spent = { turnId: string; ms: number; tokens: Tokens; usd: number; usdShared?: boolean }
+// Claude's model steps in each loop's current turn (main, or a subagent's run), so a job
+// started mid-turn counts the planning before it. Keyed by the loop's agent id, '' for main.
+const loops = new Map<string, Spent>()
+// The session cost after the last model step of any loop. The session's ledger is the only
+// source of cost and is shared by every loop, so a cost read while another loop was stepping
+// may hold that loop's spend too; such a figure is flagged rather than shown.
 let lastUsd = 0
+
+const loopOf = (agentId?: string) => agentId ?? ''
+
+const usdOf = (j: Job) => (j.usdShared ? '$? (other agents ran alongside, so the session cost cannot be split)' : `$${j.claudeUsd.toFixed(2)}`)
 
 async function append($: EngineInterface, lines: string[]) {
   if (lines.length === 0) return
@@ -102,25 +108,26 @@ async function stop($: EngineInterface) {
 }
 
 /** Starts a job for a new task, or brings back the current one for a fix round in a later turn. */
-async function joinJob($: EngineInterface, isFix: boolean) {
-  const usd = await sessionUsd($)
-  const since = { claudeMs: turnSteps.ms, claude: turnSteps.tokens, claudeUsd: Math.max(0, usd - turnStartUsd) }
+async function joinJob($: EngineInterface, isFix: boolean, loop: string) {
+  const spent = loops.get(loop)
+  const since = { claudeMs: spent?.ms ?? 0, claude: spent?.tokens ?? NO_TOKENS, claudeUsd: spent?.usd ?? 0, usdShared: !!spent?.usdShared }
   const existing = await read($, job)
   if (isFix && existing?.active) return
-  lastUsd = usd
   if (isFix && existing) {
     await update($, job, j =>
       j && {
         ...j,
         active: true,
+        loop,
         claudeMs: j.claudeMs + since.claudeMs,
         claude: addTokens(j.claude, since.claude),
         claudeUsd: j.claudeUsd + since.claudeUsd,
+        usdShared: j.usdShared || since.usdShared,
       },
     )
     return
   }
-  await update($, job, () => ({ startedAt: Date.now(), active: true, cmdcMs: 0, cmdc: NO_TOKENS, runs: [], ...since }))
+  await update($, job, () => ({ startedAt: Date.now(), active: true, loop, cmdcMs: 0, cmdc: NO_TOKENS, runs: [], ...since }))
 }
 
 export const register: Register = (on, options) => {
@@ -153,31 +160,36 @@ export const register: Register = (on, options) => {
     return { text: 'cmdc worker pane opened.' }
   })
 
-  on('turn.start', async ($, e, next) => {
-    mainTurn = e.turnId
-    turnSteps = { ms: 0, tokens: NO_TOKENS }
-    turnStartUsd = await sessionUsd($)
-    return next(e)
-  })
-
-  // Claude's side: each model step's own time (tools, cmdc included, run outside it) and usage.
+  // Claude's side: each model step's own time (tools, cmdc included, run outside it) and usage,
+  // counted for the loop that called cmdc only; other loops step past the job.
   on('turn.step', async function* ($, e, next) {
     const started = Date.now()
+    const before = await sessionUsd($)
     const result = yield* next(e)
     const ms = Date.now() - started
     const tokens = result?.usage ? tokensOf(result.usage) : NO_TOKENS
-    turnSteps = { ms: turnSteps.ms + ms, tokens: addTokens(turnSteps.tokens, tokens) }
-    if ((await read($, job))?.active) {
-      const usd = await sessionUsd($)
-      const spent = Math.max(0, usd - lastUsd)
-      lastUsd = usd
-      await update($, job, j => j && { ...j, claudeMs: j.claudeMs + ms, claude: addTokens(j.claude, tokens), claudeUsd: j.claudeUsd + spent })
+    const usd = await sessionUsd($)
+    const cost = Math.max(0, usd - Math.max(before, lastUsd))
+    lastUsd = Math.max(lastUsd, usd)
+    const loop = loopOf(e.agentId)
+    const prior = loops.get(loop)
+    const spent = prior?.turnId === e.turnId ? prior : { turnId: e.turnId, ms: 0, tokens: NO_TOKENS, usd: 0 }
+    for (const [other, s] of loops) if (other !== loop) s.usdShared = true
+    loops.set(loop, { ...spent, ms: spent.ms + ms, tokens: addTokens(spent.tokens, tokens), usd: spent.usd + cost })
+    const j = await read($, job)
+    if (j?.active && (j.loop ?? '') === loop) {
+      await update($, job, j => j && { ...j, claudeMs: j.claudeMs + ms, claude: addTokens(j.claude, tokens), claudeUsd: j.claudeUsd + cost })
+    } else if (j?.active && !j.usdShared) {
+      await update($, job, j => j && { ...j, usdShared: true })
     }
     return result
   })
 
   on('turn.complete', async ($, e, next) => {
-    if (e.turnId === mainTurn && (await read($, job))?.active) await update($, job, j => j && { ...j, active: false })
+    const loop = loopOf(e.agentId)
+    if (loops.get(loop)?.turnId === e.turnId) loops.delete(loop)
+    const j = await read($, job)
+    if (j?.active && (j.loop ?? '') === loop) await update($, job, j => j && { ...j, active: false })
     return next(e)
   })
 
@@ -191,7 +203,7 @@ export const register: Register = (on, options) => {
     const previous = await read($, run)
     const resumeId = input.resume === true ? previous.sessionId : undefined
     if (input.resume === true && !resumeId) return { deny: 'No previous cmdc session to resume; call without resume.' }
-    await joinJob($, !!resumeId)
+    await joinJob($, !!resumeId, loopOf(e.agentId))
 
     const argv = [
       'cmdc', '-p', task,
@@ -303,7 +315,7 @@ export const register: Register = (on, options) => {
       `cmdc ${status} after ${formatMs(ms)} (exit ${exit?.code ?? 'none'}${stopReason ? `, ${stopReason}` : ''}). Session ${sessionId ?? 'unknown'}.`,
       `This run: ${turns} turns, ${formatTokens(tokens)} tokens.`,
       ...(j
-        ? [`Job so far (${j.runs.length} run${j.runs.length === 1 ? '' : 's'}): cmdc ${formatMs(j.cmdcMs)}, ${formatTokens(j.cmdc)}; Claude ${formatMs(j.claudeMs)}, ${formatTokens(j.claude)}, $${j.claudeUsd.toFixed(2)}.`]
+        ? [`Job so far (${j.runs.length} run${j.runs.length === 1 ? '' : 's'}): cmdc ${formatMs(j.cmdcMs)}, ${formatTokens(j.cmdc)}; Claude ${formatMs(j.claudeMs)}, ${formatTokens(j.claude)}, ${usdOf(j)}.`]
         : []),
       '',
       "## cmdc's own summary (verify, don't trust)",
@@ -358,7 +370,7 @@ export const register: Register = (on, options) => {
               <Text color="cyan">cmdc</Text> {formatMs(j.cmdcMs + liveMs)} · {formatTokens(addTokens(j.cmdc, liveTokens))}
             </Text>
             <Text wrap="truncate-end">
-              <Text color="magenta">Claude</Text> {formatMs(j.claudeMs)} · {formatTokens(j.claude)} · ${j.claudeUsd.toFixed(2)}
+              <Text color="magenta">Claude</Text> {formatMs(j.claudeMs)} · {formatTokens(j.claude)} · {j.usdShared ? '$?' : `$${j.claudeUsd.toFixed(2)}`}
             </Text>
             <Text dimColor>total {formatMs(j.cmdcMs + liveMs + j.claudeMs)}</Text>
           </Box>

@@ -32,17 +32,21 @@ export type RunSummary = {
 
 /**
  * A task and its fix rounds: cmdc's runs and Claude's planning and reviews. Claude's
- * side counts its model steps in the turns that handed work to cmdc.
+ * side counts its model steps in the turns that handed work to cmdc, in the loop that did.
  */
 export type Job = {
   startedAt: number
   /** Whether Claude's steps count toward this job right now. */
   active: boolean
+  /** The loop whose steps count: the agent id of the subagent that called cmdc, '' for main. */
+  loop?: string
   cmdcMs: number
   cmdc: Tokens
   claudeMs: number
   claude: Tokens
   claudeUsd: number
+  /** Another loop stepped during the job, so `claudeUsd` may hold its spend too. */
+  usdShared?: boolean
   runs: RunSummary[]
 }
 
