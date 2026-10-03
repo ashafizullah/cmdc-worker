@@ -5,6 +5,8 @@
   "author": {
     "name": "Adam Suchi Hafizullah"
   },
+  "repository": "https://github.com/ashafizullah/cmdc-worker",
+  "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
     "model": {

@@ -1,5 +1,7 @@
 # cmdc-worker
 
+[![CI](https://github.com/ashafizullah/cmdc-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/ashafizullah/cmdc-worker/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A Claude Code mod in which Claude plans and reviews while [Command Code](https://commandcode.ai) (`cmdc`) writes the code.
 
 - **Tool `mcp__cmdc-worker__implement`** (`task`, `cwd?`, `resume?`): runs `cmdc -p <task> --yolo --output-format json` in `cwd` and returns cmdc's summary, time and token figures, `git status`, and the diff of what this run changed (new files in full, taken from snapshots of the working tree through a private index) for Claude to review. `resume: true` continues cmdc's previous session through `--session <id>`, so fix rounds keep cmdc's context.
@@ -32,3 +34,7 @@ claude plugin test .
 ```
 
 > cmdc runs with `--yolo`: it can edit any file and run any command in `cwd` without asking.
+
+## License
+
+[MIT](LICENSE)
