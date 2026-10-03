@@ -1,0 +1,23 @@
+{
+  "name": "cmdc-worker",
+  "version": "0.1.0",
+  "description": "Claude orchestrates, Command Code (cmdc) implements: a tool that hands a task to cmdc and returns its diff for review, with a live pane of the run.",
+  "author": {
+    "name": "Adam Suchi Hafizullah"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "cmdc model",
+      "description": "Model cmdc runs on (cmdc --list-models). Blank uses cmdc's default.",
+      "default": ""
+    },
+    "maxTurns": {
+      "type": "number",
+      "title": "Max turns per run",
+      "description": "Caps cmdc's turns in one run (--max-turns).",
+      "default": 60
+    }
+  }
+}
