@@ -1,25 +1,28 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Run, RunStatus } from '../types'
-import { parseLine, splitLines } from './events'
+import type { Job, Run, RunStatus, Tokens } from '../types'
+import { NO_TOKENS, addTokens, formatMs, formatTokens, parseLine, splitLines } from './events'
 
 const PANE = 'cmdc-worker'
 const TOOL = 'implement'
 const LOG_LIMIT = 400
 const DIFF_LIMIT = 60_000
+const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
 const IDLE: Run = { status: 'idle', task: '', cwd: '', turns: 0 }
 const run = atom({ plugin: 'cmdc-worker', key: 'run' } as const, IDLE)
 const log = atom({ plugin: 'cmdc-worker', key: 'log' } as const, [] as string[])
+const job = atom({ plugin: 'cmdc-worker', key: 'job' } as const, null as Job | null)
+const frame = atom({ plugin: 'cmdc-worker', key: 'frame' } as const, 0)
 
 const DESCRIPTION = `Hand an implementation task to Command Code (cmdc), a separate coding agent, and get back what it changed.
 
 You are the planner and reviewer; cmdc is the implementer. Workflow:
 1. Plan first: read the code you need, then write ONE self-contained task per call: the goal, the exact files and functions to touch, the constraints (naming, patterns to follow, what not to touch), and how to verify (typecheck/test commands to run).
 2. Call this tool. cmdc runs headless with all permissions (--yolo) in \`cwd\`, edits files and may run commands. The person watches it live in the "cmdc worker" pane.
-3. Review the returned git status and diff against your instructions yourself: read the changed files, run the typecheck/tests. Do not trust cmdc's own summary.
-4. If anything is wrong or missing, call again with \`resume: true\` and a precise list of fixes (file, line, what is wrong, what you expect). Repeat until the change is right, then report to the person.
+3. Review the returned diff against your instructions yourself. It covers only what changed during this run (new files in full), so a fix round shows just the fix. Run the typecheck/tests. Do not trust cmdc's own summary.
+4. If anything is wrong or missing, call again with \`resume: true\` and a precise list of fixes (file, line, what is wrong, what you expect). Repeat until the change is right, then report to the person, including the time and token figures from the report.
 
 Do not make the edits yourself unless cmdc fails repeatedly on the same point. One run at a time.`
 
@@ -28,36 +31,97 @@ type Input = { task?: unknown; cwd?: unknown; resume?: unknown }
 const clip = (text: string, max: number) =>
   text.length > max ? `${text.slice(0, max)}\n… (${text.length - max} more characters cut; read the files directly)` : text
 
-async function git($: EngineInterface, cwd: string, args: string[]): Promise<string> {
+async function git($: EngineInterface, cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
   try {
-    const { exitCode, stdout, stderr } = await $.process.run(['git', ...args], { cwd, timeoutMs: 30_000 })
+    const { exitCode, stdout, stderr } = await $.process.run(['git', ...args], { cwd, env, timeoutMs: 30_000 })
     return exitCode === 0 ? stdout : `(git ${args[0]} failed: ${stderr.trim()})`
   } catch (error) {
     return `(git ${args[0]} failed: ${String(error)})`
   }
 }
 
-const elapsed = (from?: number, to?: number) => {
-  if (from === undefined) return ''
-  const seconds = Math.round(((to ?? Date.now()) - from) / 1000)
-  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${seconds % 60}s`
+/**
+ * The working tree as a git tree object, untracked files included (ignored ones not),
+ * written through a private index so the person's staging area is left alone.
+ */
+async function snapshot($: EngineInterface, cwd: string): Promise<string | undefined> {
+  const gitDir = (await git($, cwd, ['rev-parse', '--absolute-git-dir'])).trim()
+  if (!gitDir || gitDir.startsWith('(')) return undefined
+  const env = { GIT_INDEX_FILE: `${gitDir}/cmdc-worker.index` }
+  const head = await git($, cwd, ['read-tree', 'HEAD'], env)
+  if (head.startsWith('(')) await git($, cwd, ['read-tree', '--empty'], env)
+  if ((await git($, cwd, ['add', '-A'], env)).startsWith('(')) return undefined
+  const tree = (await git($, cwd, ['write-tree'], env)).trim()
+  return /^[0-9a-f]{40,64}$/.test(tree) ? tree : undefined
+}
+
+const elapsed = (from?: number, to?: number) => (from === undefined ? '' : formatMs((to ?? Date.now()) - from))
+
+const tokensOf = (u: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }): Tokens => ({
+  input: u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens,
+  output: u.output_tokens,
+  cacheRead: u.cache_read_input_tokens,
+})
+
+async function sessionUsd($: EngineInterface): Promise<number> {
+  try {
+    return (await $.session.usage()).cost?.usd ?? 0
+  } catch {
+    return 0
+  }
 }
 
 // The running child's stream, so Stop can end it. Lost on reload, as is the child.
 let current: AsyncIterator<unknown> | undefined
+// Spins the pane's spinner while a run is going.
+let ticker: Timer | undefined
+// Claude's model steps in the current main turn, so a job started mid-turn counts the planning before it.
+let mainTurn: string | undefined
+let turnSteps = { ms: 0, tokens: NO_TOKENS }
+let turnStartUsd = 0
+// The session cost when Claude's side of the job was last counted.
+let lastUsd = 0
 
 async function append($: EngineInterface, lines: string[]) {
   if (lines.length === 0) return
   await update($, log, list => [...(list ?? []), ...lines].slice(-LOG_LIMIT))
 }
 
+function stopTicker() {
+  ticker?.cancel()
+  ticker = undefined
+}
+
 async function stop($: EngineInterface) {
   if (!current) return
   const stream = current
   current = undefined
+  stopTicker()
   await stream.return?.()
   await update($, run, r => ({ ...(r ?? IDLE), status: 'stopped' as RunStatus, endedAt: Date.now() }))
   await append($, ['■ stopped'])
+}
+
+/** Starts a job for a new task, or brings back the current one for a fix round in a later turn. */
+async function joinJob($: EngineInterface, isFix: boolean) {
+  const usd = await sessionUsd($)
+  const since = { claudeMs: turnSteps.ms, claude: turnSteps.tokens, claudeUsd: Math.max(0, usd - turnStartUsd) }
+  const existing = await read($, job)
+  if (isFix && existing?.active) return
+  lastUsd = usd
+  if (isFix && existing) {
+    await update($, job, j =>
+      j && {
+        ...j,
+        active: true,
+        claudeMs: j.claudeMs + since.claudeMs,
+        claude: addTokens(j.claude, since.claude),
+        claudeUsd: j.claudeUsd + since.claudeUsd,
+      },
+    )
+    return
+  }
+  await update($, job, () => ({ startedAt: Date.now(), active: true, cmdcMs: 0, cmdc: NO_TOKENS, runs: [], ...since }))
 }
 
 export const register: Register = (on, options) => {
@@ -90,6 +154,34 @@ export const register: Register = (on, options) => {
     return { text: 'cmdc worker pane opened.' }
   })
 
+  on('turn.start', async ($, e, next) => {
+    mainTurn = e.turnId
+    turnSteps = { ms: 0, tokens: NO_TOKENS }
+    turnStartUsd = await sessionUsd($)
+    return next(e)
+  })
+
+  // Claude's side: each model step's own time (tools, cmdc included, run outside it) and usage.
+  on('turn.step', async function* ($, e, next) {
+    const started = Date.now()
+    const result = yield* next(e)
+    const ms = Date.now() - started
+    const tokens = result?.usage ? tokensOf(result.usage) : NO_TOKENS
+    turnSteps = { ms: turnSteps.ms + ms, tokens: addTokens(turnSteps.tokens, tokens) }
+    if ((await read($, job))?.active) {
+      const usd = await sessionUsd($)
+      const spent = Math.max(0, usd - lastUsd)
+      lastUsd = usd
+      await update($, job, j => j && { ...j, claudeMs: j.claudeMs + ms, claude: addTokens(j.claude, tokens), claudeUsd: j.claudeUsd + spent })
+    }
+    return result
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    if (e.turnId === mainTurn && (await read($, job))?.active) await update($, job, j => j && { ...j, active: false })
+    return next(e)
+  })
+
   on('tool.call', { tool: 'mcp__cmdc-worker__implement' }, async ($, e, next) => {
     const input = e as unknown as Input
     const task = typeof input.task === 'string' ? input.task.trim() : ''
@@ -100,6 +192,7 @@ export const register: Register = (on, options) => {
     const previous = await read($, run)
     const resumeId = input.resume === true ? previous.sessionId : undefined
     if (input.resume === true && !resumeId) return { deny: 'No previous cmdc session to resume; call without resume.' }
+    await joinJob($, !!resumeId)
 
     const argv = [
       'cmdc', '-p', task,
@@ -110,17 +203,22 @@ export const register: Register = (on, options) => {
       ...(resumeId ? ['--session', resumeId] : []),
     ]
 
+    const before = await snapshot($, cwd)
     const startedAt = Date.now()
-    await update($, run, () => ({ status: 'running' as RunStatus, task, cwd, sessionId: resumeId, startedAt, turns: 0 }))
+    await update($, run, () => ({ status: 'running' as RunStatus, task, cwd, sessionId: resumeId, startedAt, turns: 0, activity: 'starting', tokens: NO_TOKENS }))
     await append($, ['', `━━ ${resumeId ? 'fix' : 'task'} · ${new Date(startedAt).toLocaleTimeString()} ━━`, ...task.split('\n').slice(0, 6).map(row => `» ${row}`)])
     void $.ui.open({ id: PANE, title: 'cmdc worker' })
     $.ui.status('cmdc: running')
+    stopTicker()
+    ticker = $.clock.every(120, () => void update($, frame, f => ((f ?? 0) + 1) % SPINNER.length))
 
     let sessionId = resumeId
     let finalText: string | undefined
     let stopReason: string | undefined
     let stderr = ''
     let buffer = ''
+    let tokens = NO_TOKENS
+    let turns = 0
     let exit: { code: number | null; signal: string | null } | undefined
 
     const iterator = $.process.spawn({ argv, cwd })[Symbol.asyncIterator]()
@@ -143,17 +241,27 @@ export const register: Register = (on, options) => {
         const { complete, rest } = splitLines(buffer + chunk.text)
         buffer = rest
         const lines: string[] = []
+        let activity: string | undefined
+        let usedModel: string | undefined
         for (const raw of complete) {
           const parsed = parseLine(raw)
           lines.push(...parsed.lines)
           sessionId = parsed.sessionId ?? sessionId
           finalText = parsed.finalText ?? finalText
           stopReason = parsed.stopReason ?? stopReason
-          if (parsed.turn !== undefined) {
-            const turn = parsed.turn
-            await update($, run, r => ({ ...(r ?? IDLE), turns: turn, sessionId }))
-          }
+          turns = parsed.turn ?? turns
+          activity = parsed.activity ?? activity
+          usedModel = parsed.model ?? usedModel
+          if (parsed.usage) tokens = addTokens(tokens, parsed.usage)
         }
+        await update($, run, r => ({
+          ...(r ?? IDLE),
+          turns,
+          sessionId,
+          tokens,
+          activity: activity ?? r?.activity,
+          model: usedModel ?? r?.model,
+        }))
         await append($, lines)
       }
     } catch (error) {
@@ -162,33 +270,52 @@ export const register: Register = (on, options) => {
       next.signal?.removeEventListener('abort', onAbort)
     }
 
+    stopTicker()
     const wasStopped = current === undefined
     current = undefined
     const ok = !wasStopped && exit?.code === 0
     const status: RunStatus = wasStopped ? 'stopped' : ok ? 'done' : 'failed'
-    await update($, run, r => ({ ...(r ?? IDLE), status, sessionId, finalText, endedAt: Date.now() }))
-    await append($, [`${ok ? '✓' : '✗'} ${status} in ${elapsed(startedAt)}${exit?.code ? ` (exit ${exit.code})` : ''}`])
+    const endedAt = Date.now()
+    const ms = endedAt - startedAt
+    await update($, run, r => ({ ...(r ?? IDLE), status, sessionId, finalText, endedAt, activity: undefined }))
+    await update($, job, j =>
+      j && {
+        ...j,
+        cmdcMs: j.cmdcMs + ms,
+        cmdc: addTokens(j.cmdc, tokens),
+        runs: [...j.runs, { kind: resumeId ? ('fix' as const) : ('task' as const), status, ms, turns, tokens }],
+      },
+    )
+    await append($, [`${ok ? '✓' : '✗'} ${status} in ${formatMs(ms)} · ${formatTokens(tokens)}${exit?.code ? ` (exit ${exit.code})` : ''}`])
     $.ui.status(undefined)
     $.ui.toast(`cmdc ${status}`)
 
+    const after = await snapshot($, cwd)
+    const range = before && after ? [before, after] : []
     const [statusShort, stat, diff] = await Promise.all([
       git($, cwd, ['status', '--short']),
-      git($, cwd, ['diff', '--stat']),
-      git($, cwd, ['diff']),
+      git($, cwd, ['diff', '--stat', ...range]),
+      git($, cwd, ['diff', ...range]),
     ])
+    const scope = range.length ? 'what this run changed, new files in full' : 'tracked changes against the index; read untracked (??) files directly'
 
+    const j = await read($, job)
     const report = [
-      `cmdc ${status} after ${elapsed(startedAt)} (exit ${exit?.code ?? 'none'}${stopReason ? `, ${stopReason}` : ''}). Session ${sessionId ?? 'unknown'}.`,
+      `cmdc ${status} after ${formatMs(ms)} (exit ${exit?.code ?? 'none'}${stopReason ? `, ${stopReason}` : ''}). Session ${sessionId ?? 'unknown'}.`,
+      `This run: ${turns} turns, ${formatTokens(tokens)} tokens.`,
+      ...(j
+        ? [`Job so far (${j.runs.length} run${j.runs.length === 1 ? '' : 's'}): cmdc ${formatMs(j.cmdcMs)}, ${formatTokens(j.cmdc)}; Claude ${formatMs(j.claudeMs)}, ${formatTokens(j.claude)}, $${j.claudeUsd.toFixed(2)}.`]
+        : []),
       '',
       "## cmdc's own summary (verify, don't trust)",
       finalText?.trim() || '(none)',
       ...(ok ? [] : ['', '## stderr (tail)', stderr.trim() || '(empty)']),
       '',
-      '## git status --short (untracked files show as ??; read them directly)',
+      '## git status --short',
       statusShort.trim() || '(clean)',
       '',
-      '## git diff --stat',
-      stat.trim() || '(no tracked changes)',
+      `## git diff --stat (${scope})`,
+      stat.trim() || '(no changes)',
       '',
       '## git diff',
       clip(diff, DIFF_LIMIT) || '(empty)',
@@ -203,17 +330,46 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const r = await read($, run)
     const lines = await read($, log)
-    const room = Math.max(3, (e.viewport?.rows ?? 24) - 6)
-    const color = r.status === 'running' ? 'yellow' : r.status === 'done' ? 'green' : r.status === 'idle' ? undefined : 'red'
+    const j = await read($, job)
+    const f = await read($, frame)
+    const running = r.status === 'running'
+    const runs = j?.runs ?? []
+    const room = Math.max(3, (e.viewport?.rows ?? 24) - 9 - Math.min(runs.length, 5))
+    const color = running ? 'yellow' : r.status === 'done' ? 'green' : r.status === 'idle' ? undefined : 'red'
     const firstLine = r.task.split('\n')[0] ?? ''
+    const liveMs = running && r.startedAt !== undefined ? Date.now() - r.startedAt : 0
+    const liveTokens = running ? r.tokens ?? NO_TOKENS : NO_TOKENS
 
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" gap={1}>
+          {running && <Text color="yellow">{SPINNER[f % SPINNER.length]}</Text>}
           <Text bold color={color}>{r.status}</Text>
-          {r.status !== 'idle' && <Text dimColor>turn {r.turns} · {elapsed(r.startedAt, r.status === 'running' ? undefined : r.endedAt)}</Text>}
+          {running && r.activity && <Text wrap="truncate-end">{r.activity}</Text>}
         </Box>
-        {firstLine && <Text dimColor wrap="truncate-end">{firstLine}</Text>}
+        {r.status !== 'idle' && (
+          <Text dimColor wrap="truncate-end">
+            run · turn {r.turns} · {elapsed(r.startedAt, running ? undefined : r.endedAt)} · {formatTokens(r.tokens ?? NO_TOKENS)}
+            {r.model ? ` · ${r.model}` : ''}
+          </Text>
+        )}
+        {j && (
+          <Box flexDirection="row" gap={2}>
+            <Text wrap="truncate-end">
+              <Text color="cyan">cmdc</Text> {formatMs(j.cmdcMs + liveMs)} · {formatTokens(addTokens(j.cmdc, liveTokens))}
+            </Text>
+            <Text wrap="truncate-end">
+              <Text color="magenta">Claude</Text> {formatMs(j.claudeMs)} · {formatTokens(j.claude)} · ${j.claudeUsd.toFixed(2)}
+            </Text>
+            <Text dimColor>total {formatMs(j.cmdcMs + liveMs + j.claudeMs)}</Text>
+          </Box>
+        )}
+        {runs.slice(-5).map((s, i) => (
+          <Text dimColor wrap="truncate-end">
+            {runs.length - Math.min(runs.length, 5) + i + 1}. {s.kind} {s.status === 'done' ? '✓' : '✗'} {formatMs(s.ms)} · {s.turns} turns · {formatTokens(s.tokens)}
+          </Text>
+        ))}
+        {firstLine && <Text dimColor wrap="truncate-end">» {firstLine}</Text>}
         <Box flexDirection="column" marginTop={1}>
           {lines.length === 0 && <Text dimColor>No runs yet. Claude hands tasks to cmdc here.</Text>}
           {lines.slice(-room).map(line => (
@@ -223,7 +379,7 @@ export const register: Register = (on, options) => {
           ))}
         </Box>
         <Box flexDirection="row" gap={1} marginTop={1}>
-          {r.status === 'running' && <Button key="stop" hotkey="s" variant="primary" onPress={() => stop($)}>Stop</Button>}
+          {running && <Button key="stop" hotkey="s" variant="primary" onPress={() => stop($)}>Stop</Button>}
           <Button key="clear" hotkey="c" onPress={() => update($, log, () => [])}>Clear log</Button>
         </Box>
       </Box>

@@ -4,12 +4,40 @@ export type CmdcLine =
   | { type: 'event'; event: { type: string; [key: string]: unknown } }
   | { type: 'result'; subtype?: string; sessionId?: string; finalText?: string; stopReason?: string }
 
+import type { Tokens } from '../types'
+
 export type Parsed = {
   lines: string[]
   sessionId?: string
   finalText?: string
   stopReason?: string
   turn?: number
+  activity?: string
+  /** One model request's usage; counted once per request, never from turn or run totals. */
+  usage?: Tokens
+  model?: string
+}
+
+export const NO_TOKENS: Tokens = { input: 0, output: 0, cacheRead: 0 }
+
+export const addTokens = (a: Tokens, b: Tokens): Tokens => ({
+  input: a.input + b.input,
+  output: a.output + b.output,
+  cacheRead: a.cacheRead + b.cacheRead,
+})
+
+const count = (n: number) =>
+  n < 1000 ? String(n) : n < 1_000_000 ? `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k` : `${(n / 1_000_000).toFixed(1)}M`
+
+/** `↑4.4M (96% cached) ↓37k`. */
+export function formatTokens(t: Tokens): string {
+  const cached = t.input > 0 && t.cacheRead > 0 ? ` (${Math.round((t.cacheRead / t.input) * 100)}% cached)` : ''
+  return `↑${count(t.input)}${cached} ↓${count(t.output)}`
+}
+
+export function formatMs(ms: number): string {
+  const seconds = Math.round(ms / 1000)
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`
 }
 
 const clip = (text: string, max: number) =>
@@ -52,10 +80,16 @@ export function parseLine(raw: string): Parsed {
     case 'run_start':
       return { lines: ['● run started'], sessionId: ev.sessionId as string | undefined }
     case 'turn_start':
-      return { lines: [], turn: ev.turnNumber as number }
+      return { lines: [], turn: ev.turnNumber as number, activity: 'thinking' }
     case 'tool_queued': {
       const arg = toolArg(ev.input)
-      return { lines: [`▸ ${String(ev.toolName)}${arg ? ` ${arg}` : ''}`] }
+      const call = `${String(ev.toolName)}${arg ? ` ${arg}` : ''}`
+      return { lines: [`▸ ${call}`], activity: call }
+    }
+    case 'model_request_end': {
+      const u = ev.usage as Partial<Record<'inputTokens' | 'outputTokens' | 'cacheReadTokens', number>> | undefined
+      const usage = u && { input: u.inputTokens ?? 0, output: u.outputTokens ?? 0, cacheRead: u.cacheReadTokens ?? 0 }
+      return { lines: [], usage, model: typeof ev.model === 'string' ? ev.model : undefined }
     }
     case 'tool_completed': {
       const result = ev.result as { type: string; text?: string }[] | undefined

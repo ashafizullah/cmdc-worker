@@ -2,8 +2,8 @@
 
 A Claude Code mod in which Claude plans and reviews while [Command Code](https://commandcode.ai) (`cmdc`) writes the code.
 
-- **Tool `mcp__cmdc-worker__implement`** (`task`, `cwd?`, `resume?`): runs `cmdc -p <task> --yolo --output-format json` in `cwd` and returns cmdc's summary, `git status`, `git diff --stat` and the full diff for Claude to review. `resume: true` continues cmdc's previous session through `--session <id>`, so fix rounds keep cmdc's context.
-- **Pane "cmdc worker"** (`/cmdc`): shows the run live (tool calls, cmdc's messages, turn and elapsed time), with a Stop button (`s`) and a Clear log button (`c`).
+- **Tool `mcp__cmdc-worker__implement`** (`task`, `cwd?`, `resume?`): runs `cmdc -p <task> --yolo --output-format json` in `cwd` and returns cmdc's summary, time and token figures, `git status`, and the diff of what this run changed (new files in full, taken from snapshots of the working tree through a private index) for Claude to review. `resume: true` continues cmdc's previous session through `--session <id>`, so fix rounds keep cmdc's context.
+- **Pane "cmdc worker"** (`/cmdc`): shows the run live with a spinner and what cmdc is doing, the run's turn, time, tokens and model, the job's totals for cmdc and for Claude (its model steps' time, tokens and cost in the turns that handed work to cmdc), and one line per run. Stop button (`s`), Clear log button (`c`).
 
 ## Loop
 
