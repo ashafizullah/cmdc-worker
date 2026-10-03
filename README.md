@@ -18,6 +18,11 @@ A Claude Code mod in which Claude plans and reviews while [Command Code](https:/
 
 `model` (passed as `--model`) and `maxTurns` (default 60), in `/config` or under `pluginConfigs["cmdc-worker"]`.
 
+## Requirements
+
+- [Claude Code](https://claude.com/claude-code) with a Claude subscription (or API access).
+- [Command Code](https://commandcode.ai) with a subscription, and `cmdc` installed and signed in.
+
 ## Load
 
 ```sh
