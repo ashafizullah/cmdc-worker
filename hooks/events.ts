@@ -118,3 +118,13 @@ export function parseLine(raw: string): Parsed {
       return { lines: [] }
   }
 }
+
+/** The diff cut to `limit` characters, shared out per file so a large file cannot hide the rest. */
+export function clipDiff(diff: string, limit: number): string {
+  if (diff.length <= limit) return diff
+  const files = diff.split(/(?=^diff --git )/m)
+  const share = Math.max(1_500, Math.floor(limit / files.length))
+  return files
+    .map(file => (file.length > share ? `${file.slice(0, share)}\n… (${file.length - share} more characters of this file cut; read it directly)\n` : file))
+    .join('')
+}

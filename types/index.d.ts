@@ -21,9 +21,12 @@ export type Run = {
   tokens?: Tokens
 }
 
+/** What started a run: Claude's task, Claude's fix list, or the plugin after verify failed. */
+export type RunKind = 'task' | 'fix' | 'auto-fix'
+
 /** One cmdc run of a job. */
 export type RunSummary = {
-  kind: 'task' | 'fix'
+  kind: RunKind
   status: RunStatus
   ms: number
   turns: number

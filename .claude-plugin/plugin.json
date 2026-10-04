@@ -20,6 +20,12 @@
       "title": "Max turns per run",
       "description": "Caps cmdc's turns in one run (--max-turns).",
       "default": 60
+    },
+    "autoFix": {
+      "type": "number",
+      "title": "Automatic fix rounds",
+      "description": "When verify fails, how many times cmdc is sent the failure to fix before Claude sees the report. 0 turns it off.",
+      "default": 3
     }
   }
 }

@@ -1,13 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Job, Run, RunStatus, Tokens } from '../types'
-import { NO_TOKENS, addTokens, formatMs, formatTokens, parseLine, splitLines } from './events'
+import type { Job, Run, RunKind, RunStatus, Tokens } from '../types'
+import { NO_TOKENS, addTokens, clipDiff, formatMs, formatTokens, parseLine, splitLines } from './events'
 
 const PANE = 'cmdc-worker'
 const TOOL = 'implement'
 const LOG_LIMIT = 400
 const DIFF_LIMIT = 60_000
+// The diff budget once verify passed: the review is a skim, and the report stays in Claude's context.
+const PASSED_DIFF_LIMIT = 16_000
 const VERIFY_LIMIT = 6_000
 const VERIFY_TIMEOUT_MS = 10 * 60_000
 const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -22,11 +24,12 @@ const DESCRIPTION = `Hand an implementation task to Command Code (cmdc), a separ
 
 You are the planner and reviewer; cmdc is the implementer. The point is to spend as few of your own requests as possible, so:
 1. Do not explore the code first: cmdc reads the codebase itself. Write ONE task per call from what you already know: the goal, the expected behaviour, the constraints (what not to touch, patterns to follow), and any files or functions you already know matter.
-2. Call this tool with \`verify\` set to the command that proves the change (tests, typecheck, lint). cmdc runs headless with all permissions (--yolo) in \`cwd\`; the person watches it live in the "cmdc worker" pane. After cmdc finishes the plugin runs \`verify\` itself.
-3. Review the report in one go: the diff (only what this run changed, new files in full) and the \`verify\` result. Do not rerun the tests or reread the files unless the report leaves a real doubt. Do not trust cmdc's own summary.
-4. If anything is wrong or missing, call again with \`resume: true\` and a precise list of fixes (file, line, what is wrong, what you expect). Once the change is right, report to the person, including the time and token figures from the report.
+2. Make each call count: every call costs you at least two requests whatever its size, so hand over a whole feature, or several related changes, in one task rather than one small step at a time.
+3. Call this tool with \`verify\` set to the command that proves the change (tests, typecheck, lint). cmdc runs headless with all permissions (--yolo) in \`cwd\`; the person watches it live in the "cmdc worker" pane. After cmdc finishes the plugin runs \`verify\`; when it fails, the plugin sends the failure back to cmdc and retries on its own a few times before reporting to you.
+4. Review the report in one go: the diff (only what this call changed, new files in full; shortened per file when verify passed and the diff is large) and the \`verify\` result. Check that automatic fix rounds did not weaken or delete tests. Do not rerun the tests or reread the files unless the report leaves a real doubt. Do not trust cmdc's own summary.
+5. If anything is wrong or missing, call again with \`resume: true\` and a precise list of fixes (file, line, what is wrong, what you expect). Once the change is right, report to the person, including the time and token figures from the report.
 
-For a small edit you can make in one or two steps yourself, make it yourself instead: a cmdc round costs you at least two requests. Do not make cmdc's edits yourself unless cmdc fails repeatedly on the same point. One run at a time.`
+For a small edit you can make in one or two steps yourself, make it yourself instead. Do not make cmdc's edits yourself unless cmdc fails repeatedly on the same point. One run at a time.`
 
 type Input = { task?: unknown; cwd?: unknown; resume?: unknown; verify?: unknown }
 
@@ -52,6 +55,9 @@ async function verify($: EngineInterface, cwd: string, command: string): Promise
     return { code: null, output: `(could not run: ${String(error)})` }
   }
 }
+
+const fixTask = (command: string, check: { code: number | null; output: string }) =>
+  `The verify command \`${command}\` failed (exit ${check.code ?? 'none'}). Fix the code so it passes. Do not weaken, skip or delete tests to make them pass. Its output:\n\n${check.output || '(no output)'}`
 
 /**
  * The working tree as a git tree object, untracked files included (ignored ones not),
@@ -143,9 +149,112 @@ async function joinJob($: EngineInterface, isFix: boolean, loop: string) {
   await update($, job, () => ({ startedAt: Date.now(), active: true, loop, cmdcMs: 0, cmdc: NO_TOKENS, runs: [], ...since }))
 }
 
+/** One cmdc process: streams its events into the pane and the job, and gives what it ended with. */
+async function runCmdc(
+  $: EngineInterface,
+  args: { task: string; cwd: string; resumeId?: string; kind: RunKind; signal?: AbortSignal; model: string; maxTurns: number },
+) {
+  const { task, cwd, resumeId, kind, signal, model, maxTurns } = args
+  const argv = [
+    'cmdc', '-p', task,
+    '--output-format', 'json',
+    '--yolo', '-t', '--skip-onboarding', '--no-auto-update',
+    '--max-turns', String(maxTurns),
+    ...(model ? ['--model', model] : []),
+    ...(resumeId ? ['--session', resumeId] : []),
+  ]
+
+  const startedAt = Date.now()
+  await update($, run, () => ({ status: 'running' as RunStatus, task, cwd, sessionId: resumeId, startedAt, turns: 0, activity: 'starting', tokens: NO_TOKENS }))
+  await append($, ['', `━━ ${kind} · ${new Date(startedAt).toLocaleTimeString()} ━━`, ...task.split('\n').slice(0, 6).map(row => `» ${row}`)])
+  void $.ui.open({ id: PANE, title: 'cmdc worker' })
+  $.ui.status('cmdc: running')
+  stopTicker()
+  ticker = $.clock.every(120, () => void update($, frame, f => ((f ?? 0) + 1) % SPINNER.length))
+
+  let sessionId = resumeId
+  let finalText: string | undefined
+  let stopReason: string | undefined
+  let stderr = ''
+  let buffer = ''
+  let tokens = NO_TOKENS
+  let turns = 0
+  let exit: { code: number | null; signal: string | null } | undefined
+
+  const iterator = $.process.spawn({ argv, cwd })[Symbol.asyncIterator]()
+  current = iterator
+  const onAbort = () => void stop($)
+  signal?.addEventListener('abort', onAbort)
+
+  try {
+    while (true) {
+      const step = await iterator.next()
+      if (step.done) {
+        exit = step.value as typeof exit
+        break
+      }
+      const chunk = step.value
+      if (chunk.stream === 'stderr') {
+        stderr = (stderr + chunk.text).slice(-4000)
+        continue
+      }
+      const { complete, rest } = splitLines(buffer + chunk.text)
+      buffer = rest
+      const lines: string[] = []
+      let activity: string | undefined
+      let usedModel: string | undefined
+      for (const raw of complete) {
+        const parsed = parseLine(raw)
+        lines.push(...parsed.lines)
+        sessionId = parsed.sessionId ?? sessionId
+        finalText = parsed.finalText ?? finalText
+        stopReason = parsed.stopReason ?? stopReason
+        turns = parsed.turn ?? turns
+        activity = parsed.activity ?? activity
+        usedModel = parsed.model ?? usedModel
+        if (parsed.usage) tokens = addTokens(tokens, parsed.usage)
+      }
+      await update($, run, r => ({
+        ...(r ?? IDLE),
+        turns,
+        sessionId,
+        tokens,
+        activity: activity ?? r?.activity,
+        model: usedModel ?? r?.model,
+      }))
+      await append($, lines)
+    }
+  } catch (error) {
+    stderr += `\n${String(error)}`
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+  }
+
+  stopTicker()
+  const wasStopped = current === undefined
+  current = undefined
+  const status: RunStatus = wasStopped ? 'stopped' : exit?.code === 0 ? 'done' : 'failed'
+  const endedAt = Date.now()
+  const ms = endedAt - startedAt
+  await update($, run, r => ({ ...(r ?? IDLE), status, sessionId, finalText, endedAt, activity: undefined }))
+  await update($, job, j => j && { ...j, cmdcMs: j.cmdcMs + ms, cmdc: addTokens(j.cmdc, tokens), runs: [...j.runs, { kind, status, ms, turns, tokens }] })
+  await append($, [`${status === 'done' ? '✓' : '✗'} ${status} in ${formatMs(ms)} · ${formatTokens(tokens)}${exit?.code ? ` (exit ${exit.code})` : ''}`])
+  $.ui.status(undefined)
+  return { status, sessionId, finalText, stopReason, stderr, tokens, turns, exit, ms }
+}
+
+async function runVerify($: EngineInterface, cwd: string, command: string) {
+  $.ui.status('cmdc: verifying')
+  const check = await verify($, cwd, command)
+  $.ui.status(undefined)
+  await append($, [`${check.code === 0 ? '✓' : '✗'} verify ${command} (exit ${check.code ?? 'none'})`])
+  return check
+}
+
 export const register: Register = (on, options) => {
   const model = typeof options.model === 'string' ? options.model.trim() : ''
   const maxTurns = typeof options.maxTurns === 'number' && options.maxTurns > 0 ? options.maxTurns : 60
+  const autoFix = typeof options.autoFix === 'number' && options.autoFix >= 0 ? Math.floor(options.autoFix) : 3
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'cmdc', description: 'Open the cmdc worker pane' })
@@ -223,104 +332,25 @@ export const register: Register = (on, options) => {
     if (input.resume === true && !resumeId) return { deny: 'No previous cmdc session to resume; call without resume.' }
     await joinJob($, !!resumeId, loopOf(e.agentId))
 
-    const argv = [
-      'cmdc', '-p', task,
-      '--output-format', 'json',
-      '--yolo', '-t', '--skip-onboarding', '--no-auto-update',
-      '--max-turns', String(maxTurns),
-      ...(model ? ['--model', model] : []),
-      ...(resumeId ? ['--session', resumeId] : []),
-    ]
-
     const before = await snapshot($, cwd)
-    const startedAt = Date.now()
-    await update($, run, () => ({ status: 'running' as RunStatus, task, cwd, sessionId: resumeId, startedAt, turns: 0, activity: 'starting', tokens: NO_TOKENS }))
-    await append($, ['', `━━ ${resumeId ? 'fix' : 'task'} · ${new Date(startedAt).toLocaleTimeString()} ━━`, ...task.split('\n').slice(0, 6).map(row => `» ${row}`)])
-    void $.ui.open({ id: PANE, title: 'cmdc worker' })
-    $.ui.status('cmdc: running')
-    stopTicker()
-    ticker = $.clock.every(120, () => void update($, frame, f => ((f ?? 0) + 1) % SPINNER.length))
-
-    let sessionId = resumeId
-    let finalText: string | undefined
-    let stopReason: string | undefined
-    let stderr = ''
-    let buffer = ''
-    let tokens = NO_TOKENS
-    let turns = 0
-    let exit: { code: number | null; signal: string | null } | undefined
-
-    const iterator = $.process.spawn({ argv, cwd })[Symbol.asyncIterator]()
-    current = iterator
-    const onAbort = () => void stop($)
-    next.signal?.addEventListener('abort', onAbort)
-
-    try {
-      while (true) {
-        const step = await iterator.next()
-        if (step.done) {
-          exit = step.value as typeof exit
-          break
-        }
-        const chunk = step.value
-        if (chunk.stream === 'stderr') {
-          stderr = (stderr + chunk.text).slice(-4000)
-          continue
-        }
-        const { complete, rest } = splitLines(buffer + chunk.text)
-        buffer = rest
-        const lines: string[] = []
-        let activity: string | undefined
-        let usedModel: string | undefined
-        for (const raw of complete) {
-          const parsed = parseLine(raw)
-          lines.push(...parsed.lines)
-          sessionId = parsed.sessionId ?? sessionId
-          finalText = parsed.finalText ?? finalText
-          stopReason = parsed.stopReason ?? stopReason
-          turns = parsed.turn ?? turns
-          activity = parsed.activity ?? activity
-          usedModel = parsed.model ?? usedModel
-          if (parsed.usage) tokens = addTokens(tokens, parsed.usage)
-        }
-        await update($, run, r => ({
-          ...(r ?? IDLE),
-          turns,
-          sessionId,
-          tokens,
-          activity: activity ?? r?.activity,
-          model: usedModel ?? r?.model,
-        }))
-        await append($, lines)
-      }
-    } catch (error) {
-      stderr += `\n${String(error)}`
-    } finally {
-      next.signal?.removeEventListener('abort', onAbort)
+    const first = await runCmdc($, { task, cwd, resumeId, kind: resumeId ? 'fix' : 'task', signal: next.signal, model, maxTurns })
+    const attempts = [first]
+    let check = verifyCommand && first.status !== 'stopped' ? await runVerify($, cwd, verifyCommand) : undefined
+    while (check && check.code !== 0 && attempts.length <= autoFix) {
+      const last = attempts[attempts.length - 1]
+      if (last.status === 'stopped' || !last.sessionId) break
+      await append($, [`↻ verify failed: auto-fix ${attempts.length}/${autoFix}`])
+      const fix = await runCmdc($, { task: fixTask(verifyCommand, check), cwd, resumeId: last.sessionId, kind: 'auto-fix', signal: next.signal, model, maxTurns })
+      attempts.push(fix)
+      if (fix.status === 'stopped') break
+      check = await runVerify($, cwd, verifyCommand)
     }
-
-    stopTicker()
-    const wasStopped = current === undefined
-    current = undefined
-    const ok = !wasStopped && exit?.code === 0
-    const status: RunStatus = wasStopped ? 'stopped' : ok ? 'done' : 'failed'
-    const endedAt = Date.now()
-    const ms = endedAt - startedAt
-    await update($, run, r => ({ ...(r ?? IDLE), status, sessionId, finalText, endedAt, activity: undefined }))
-    await update($, job, j =>
-      j && {
-        ...j,
-        cmdcMs: j.cmdcMs + ms,
-        cmdc: addTokens(j.cmdc, tokens),
-        runs: [...j.runs, { kind: resumeId ? ('fix' as const) : ('task' as const), status, ms, turns, tokens }],
-      },
-    )
-    await append($, [`${ok ? '✓' : '✗'} ${status} in ${formatMs(ms)} · ${formatTokens(tokens)}${exit?.code ? ` (exit ${exit.code})` : ''}`])
-    $.ui.status(undefined)
-    $.ui.toast(`cmdc ${status}`)
-
-    const check = verifyCommand && !wasStopped ? await verify($, cwd, verifyCommand) : undefined
-    if (check) await append($, [`${check.code === 0 ? '✓' : '✗'} verify ${verifyCommand} (exit ${check.code ?? 'none'})`])
+    const last = attempts[attempts.length - 1]
+    const ms = attempts.reduce((sum, a) => sum + a.ms, 0)
+    const turns = attempts.reduce((sum, a) => sum + a.turns, 0)
+    const tokens = attempts.reduce((sum, a) => addTokens(sum, a.tokens), NO_TOKENS)
+    const autoFixes = attempts.length - 1
+    $.ui.toast(`cmdc ${last.status}${check ? `, verify ${check.code === 0 ? 'passed' : 'failed'}` : ''}`)
 
     const after = await snapshot($, cwd)
     const range = before && after ? [before, after] : []
@@ -329,21 +359,23 @@ export const register: Register = (on, options) => {
       git($, cwd, ['diff', '--stat', ...range]),
       git($, cwd, ['diff', ...range]),
     ])
-    const scope = range.length ? 'what this run changed, new files in full' : 'tracked changes against the index; read untracked (??) files directly'
+    const scope = range.length ? 'what this call changed, new files in full' : 'tracked changes against the index; read untracked (??) files directly'
+    const passed = check?.code === 0
+    const shown = clipDiff(diff, passed ? PASSED_DIFF_LIMIT : DIFF_LIMIT)
 
     const j = await read($, job)
     const report = [
-      `cmdc ${status} after ${formatMs(ms)} (exit ${exit?.code ?? 'none'}${stopReason ? `, ${stopReason}` : ''}). Session ${sessionId ?? 'unknown'}.`,
-      `This run: ${turns} turns, ${formatTokens(tokens)} tokens.`,
+      `cmdc ${last.status} after ${formatMs(ms)} (exit ${last.exit?.code ?? 'none'}${last.stopReason ? `, ${last.stopReason}` : ''})${autoFixes ? `, ${autoFixes} automatic fix round${autoFixes === 1 ? '' : 's'}` : ''}. Session ${last.sessionId ?? 'unknown'}.`,
+      `This call: ${turns} turns, ${formatTokens(tokens)} tokens.`,
       ...(j
         ? [`Job so far (${j.runs.length} run${j.runs.length === 1 ? '' : 's'}): cmdc ${formatMs(j.cmdcMs)}, ${formatTokens(j.cmdc)}; Claude ${formatMs(j.claudeMs)}, ${formatTokens(j.claude)}, ${usdOf(j)}.`]
         : []),
       '',
       "## cmdc's own summary (verify, don't trust)",
-      finalText?.trim() || '(none)',
-      ...(ok ? [] : ['', '## stderr (tail)', stderr.trim() || '(empty)']),
+      last.finalText?.trim() || '(none)',
+      ...(last.status === 'failed' ? ['', '## stderr (tail)', last.stderr.trim() || '(empty)'] : []),
       ...(check
-        ? ['', `## verify: ${verifyCommand} (${check.code === 0 ? 'passed' : `failed, exit ${check.code ?? 'none'}`})`, check.output || '(no output)']
+        ? ['', `## verify: ${verifyCommand} (${passed ? 'passed' : `failed, exit ${check.code ?? 'none'}`}${autoFixes ? ` after ${autoFixes} automatic fix round${autoFixes === 1 ? '' : 's'}` : ''})`, check.output || '(no output)']
         : ['', '## verify', "(none given: run the checks yourself, and pass `verify` next time)"]),
       '',
       '## git status --short',
@@ -352,8 +384,8 @@ export const register: Register = (on, options) => {
       `## git diff --stat (${scope})`,
       stat.trim() || '(no changes)',
       '',
-      '## git diff',
-      clip(diff, DIFF_LIMIT) || '(empty)',
+      `## git diff${shown.length < diff.length ? ' (shortened per file)' : ''}`,
+      shown || '(empty)',
       '',
       'Now review this against your instructions in one step. If anything is off, call again with resume: true and a precise fix list.',
     ].join('\n')

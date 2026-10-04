@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { formatMs, formatTokens, parseLine, splitLines } from '../hooks/events'
+import { clipDiff, formatMs, formatTokens, parseLine, splitLines } from '../hooks/events'
 
 const TOOL = 'mcp__cmdc-worker__implement'
 
@@ -17,7 +17,7 @@ const RUN = ndjson(
   { type: 'result', subtype: 'success', sessionId: 'sess-1', stopReason: 'end_turn', finalText: 'Added a.ts' },
 )
 
-function world(on: On) {
+function world(on: On, verifyExits: number[] = []) {
   const spawned: (readonly string[])[] = []
   const gitCalls: (readonly string[])[] = []
   let tree = 0
@@ -37,7 +37,8 @@ function world(on: On) {
       : sub === 'write-tree' ? `${String(++tree).padStart(40, '0')}\n`
       : sub === 'diff' && e.argv.length > 3 ? 'diff --git a/src/a.ts b/src/a.ts\n+new file\n'
       : ''
-    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    const exitCode = e.argv[0] === 'sh' ? (verifyExits.shift() ?? 0) : 0
+    return { value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('process.spawn', async function* (_, e) {
     spawned.push(e.argv)
@@ -60,6 +61,11 @@ test('parses cmdc events into log lines', async () => {
   expect(formatMs(802_000)).toBe('13m22s')
   expect(parseLine(JSON.stringify({ type: 'event', event: { type: 'run_start', sessionId: 'x' } })).sessionId).toBe('x')
   expect(splitLines('a\nb\npar')).toEqual({ complete: ['a', 'b'], rest: 'par' })
+  const big = `diff --git a/x\n${'x'.repeat(5_000)}\ndiff --git a/y\n+small\n`
+  expect(clipDiff(big, 100_000)).toBe(big)
+  const clipped = clipDiff(big, 3_000)
+  expect(clipped).toContain('more characters of this file cut')
+  expect(clipped).toContain('diff --git a/y\n+small')
 })
 
 test('refuses an empty task', async ($, on) => {
@@ -85,7 +91,7 @@ test('runs cmdc, then resumes its session for fixes', async ($, on) => {
   expect(report).toContain('?? src/a.ts')
   expect(spawned[0]).toContain('--yolo')
   expect(spawned[0]).not.toContain('--session')
-  expect(report).toContain('This run: 1 turns, ↑200 new + 800 cached · ctx 1.0k ↓20 tokens.')
+  expect(report).toContain('This call: 1 turns, ↑200 new + 800 cached · ctx 1.0k ↓20 tokens.')
   expect(report).toContain('Job so far (1 run): cmdc')
   expect(report).toContain('+new file')
   expect(report).toContain('(none given: run the checks yourself')
@@ -158,4 +164,21 @@ test('runs the verify command after cmdc and reports its result', async ($, on) 
   const report = String((await $.tool.call({ tool: TOOL, task: 'Add a.ts', verify: 'npm test' } as never)).result)
   expect(gitCalls).toContainEqual(['sh', '-c', 'npm test'])
   expect(report).toContain('## verify: npm test (passed)\n# pass 3')
+})
+
+test('sends a failed verify back to cmdc and retries before reporting', async ($, on) => {
+  const { spawned } = world(on, [1, 0])
+  const report = String((await $.tool.call({ tool: TOOL, task: 'Add a.ts', verify: 'npm test' } as never)).result)
+  expect(spawned).toHaveLength(2)
+  expect(spawned[1]?.slice(-2)).toEqual(['--session', 'sess-1'])
+  expect(spawned[1]?.[2]).toContain('`npm test` failed (exit 1)')
+  expect(report).toContain('1 automatic fix round.')
+  expect(report).toContain('## verify: npm test (passed after 1 automatic fix round)')
+})
+
+test('stops retrying after the automatic fix rounds run out', async ($, on) => {
+  const { spawned } = world(on, [1, 1, 1, 1, 1])
+  const report = String((await $.tool.call({ tool: TOOL, task: 'Add a.ts', verify: 'npm test' } as never)).result)
+  expect(spawned).toHaveLength(4)
+  expect(report).toContain('## verify: npm test (failed, exit 1 after 3 automatic fix rounds)')
 })
