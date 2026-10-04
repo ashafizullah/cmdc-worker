@@ -4,14 +4,16 @@
 
 A Claude Code mod in which Claude plans and reviews while [Command Code](https://commandcode.ai) (`cmdc`) writes the code.
 
-- **Tool `mcp__cmdc-worker__implement`** (`task`, `cwd?`, `resume?`): runs `cmdc -p <task> --yolo --output-format json` in `cwd` and returns cmdc's summary, time and token figures, `git status`, and the diff of what this run changed (new files in full, taken from snapshots of the working tree through a private index) for Claude to review. `resume: true` continues cmdc's previous session through `--session <id>`, so fix rounds keep cmdc's context.
-- **Pane "cmdc worker"** (`/cmdc`): shows the run live with a spinner and what cmdc is doing, the run's turn, time, tokens and model, the job's totals for cmdc and for Claude (its model steps' time, tokens and cost in the turns that handed work to cmdc), and one line per run. Stop button (`s`), Clear log button (`c`).
+- **Tool `mcp__cmdc-worker__implement`** (`task`, `cwd?`, `resume?`, `verify?`): runs `cmdc -p <task> --yolo --output-format json` in `cwd`, then the `verify` command (e.g. `npm test`) if given, and returns cmdc's summary, time and token figures, the `verify` exit code and output tail, `git status`, and the diff of what this run changed (new files in full, taken from snapshots of the working tree through a private index) for Claude to review. `resume: true` continues cmdc's previous session through `--session <id>`, so fix rounds keep cmdc's context.
+- **Pane "cmdc worker"** (`/cmdc`): shows the run live with a spinner and what cmdc is doing, the run's turn, time, tokens and model, the job's totals for cmdc and for Claude (its model steps' time, tokens and cost in the turns that handed work to cmdc, in the loop that called it; the cost shows as `$?` when other agents ran alongside), and one line per run. Stop button (`s`), Clear log button (`c`).
 
 ## Loop
 
-1. Claude reads the code and writes one self-contained task.
-2. cmdc implements it.
-3. Claude reviews the diff, runs typecheck and tests.
+The loop is built to spend as few Claude requests as possible: Claude reads no code up front and runs no checks itself.
+
+1. Claude writes one task from what it already knows, with a `verify` command.
+2. cmdc explores the code and implements it; the plugin then runs `verify`.
+3. Claude reviews the diff and the `verify` result in one step.
 4. If something is wrong, Claude calls again with `resume: true` and a precise list of fixes. This repeats until the change is right.
 
 ## Settings

@@ -31,7 +31,8 @@ function world(on: On) {
     gitCalls.push(e.argv)
     const sub = e.argv[1]
     const stdout =
-      sub === 'status' ? '?? src/a.ts\n'
+      e.argv[0] === 'sh' ? '# pass 3\n'
+      : sub === 'status' ? '?? src/a.ts\n'
       : sub === 'rev-parse' ? '/repo/.git\n'
       : sub === 'write-tree' ? `${String(++tree).padStart(40, '0')}\n`
       : sub === 'diff' && e.argv.length > 3 ? 'diff --git a/src/a.ts b/src/a.ts\n+new file\n'
@@ -87,6 +88,7 @@ test('runs cmdc, then resumes its session for fixes', async ($, on) => {
   expect(report).toContain('This run: 1 turns, ↑200 new + 800 cached · ctx 1.0k ↓20 tokens.')
   expect(report).toContain('Job so far (1 run): cmdc')
   expect(report).toContain('+new file')
+  expect(report).toContain('(none given: run the checks yourself')
   // The diff spans the trees written before and after the run.
   expect(gitCalls.find(a => a[1] === 'diff' && a[2] !== '--stat')?.slice(2)).toEqual(['0'.repeat(39) + '1', '0'.repeat(39) + '2'])
 
@@ -149,4 +151,11 @@ test("Claude's figures count only the loop that called cmdc, and flag a shared c
   await step('s1', 'sub-1')
   await step('t1')
   expect(await claudeLine($, /Claude.*↑200 new · ctx 100 ↓2 · \$\?/)).toBeDefined()
+})
+
+test('runs the verify command after cmdc and reports its result', async ($, on) => {
+  const { gitCalls } = world(on)
+  const report = String((await $.tool.call({ tool: TOOL, task: 'Add a.ts', verify: 'npm test' } as never)).result)
+  expect(gitCalls).toContainEqual(['sh', '-c', 'npm test'])
+  expect(report).toContain('## verify: npm test (passed)\n# pass 3')
 })

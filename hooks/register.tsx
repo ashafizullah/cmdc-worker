@@ -8,6 +8,8 @@ const PANE = 'cmdc-worker'
 const TOOL = 'implement'
 const LOG_LIMIT = 400
 const DIFF_LIMIT = 60_000
+const VERIFY_LIMIT = 6_000
+const VERIFY_TIMEOUT_MS = 10 * 60_000
 const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
 const IDLE: Run = { status: 'idle', task: '', cwd: '', turns: 0 }
@@ -16,17 +18,17 @@ const log = atom({ plugin: 'cmdc-worker', key: 'log' } as const, [] as string[])
 const job = atom({ plugin: 'cmdc-worker', key: 'job' } as const, null as Job | null)
 const frame = atom({ plugin: 'cmdc-worker', key: 'frame' } as const, 0)
 
-const DESCRIPTION = `Hand an implementation task to Command Code (cmdc), a separate coding agent, and get back what it changed.
+const DESCRIPTION = `Hand an implementation task to Command Code (cmdc), a separate coding agent, and get back what it changed and whether it passes.
 
-You are the planner and reviewer; cmdc is the implementer. Workflow:
-1. Plan first: read the code you need, then write ONE self-contained task per call: the goal, the exact files and functions to touch, the constraints (naming, patterns to follow, what not to touch), and how to verify (typecheck/test commands to run).
-2. Call this tool. cmdc runs headless with all permissions (--yolo) in \`cwd\`, edits files and may run commands. The person watches it live in the "cmdc worker" pane.
-3. Review the returned diff against your instructions yourself. It covers only what changed during this run (new files in full), so a fix round shows just the fix. Run the typecheck/tests. Do not trust cmdc's own summary.
-4. If anything is wrong or missing, call again with \`resume: true\` and a precise list of fixes (file, line, what is wrong, what you expect). Repeat until the change is right, then report to the person, including the time and token figures from the report.
+You are the planner and reviewer; cmdc is the implementer. The point is to spend as few of your own requests as possible, so:
+1. Do not explore the code first: cmdc reads the codebase itself. Write ONE task per call from what you already know: the goal, the expected behaviour, the constraints (what not to touch, patterns to follow), and any files or functions you already know matter.
+2. Call this tool with \`verify\` set to the command that proves the change (tests, typecheck, lint). cmdc runs headless with all permissions (--yolo) in \`cwd\`; the person watches it live in the "cmdc worker" pane. After cmdc finishes the plugin runs \`verify\` itself.
+3. Review the report in one go: the diff (only what this run changed, new files in full) and the \`verify\` result. Do not rerun the tests or reread the files unless the report leaves a real doubt. Do not trust cmdc's own summary.
+4. If anything is wrong or missing, call again with \`resume: true\` and a precise list of fixes (file, line, what is wrong, what you expect). Once the change is right, report to the person, including the time and token figures from the report.
 
-Do not make the edits yourself unless cmdc fails repeatedly on the same point. One run at a time.`
+For a small edit you can make in one or two steps yourself, make it yourself instead: a cmdc round costs you at least two requests. Do not make cmdc's edits yourself unless cmdc fails repeatedly on the same point. One run at a time.`
 
-type Input = { task?: unknown; cwd?: unknown; resume?: unknown }
+type Input = { task?: unknown; cwd?: unknown; resume?: unknown; verify?: unknown }
 
 const clip = (text: string, max: number) =>
   text.length > max ? `${text.slice(0, max)}\n… (${text.length - max} more characters cut; read the files directly)` : text
@@ -37,6 +39,17 @@ async function git($: EngineInterface, cwd: string, args: string[], env?: Record
     return exitCode === 0 ? stdout : `(git ${args[0]} failed: ${stderr.trim()})`
   } catch (error) {
     return `(git ${args[0]} failed: ${String(error)})`
+  }
+}
+
+/** Runs the verify command and gives its exit code and output, the tail kept when long. */
+async function verify($: EngineInterface, cwd: string, command: string): Promise<{ code: number | null; output: string }> {
+  try {
+    const { exitCode, stdout, stderr } = await $.process.run(['sh', '-c', command], { cwd, timeoutMs: VERIFY_TIMEOUT_MS })
+    const output = [stdout, stderr].filter(text => text.trim()).join('\n').trim()
+    return { code: exitCode, output: output.length > VERIFY_LIMIT ? `… (${output.length - VERIFY_LIMIT} earlier characters cut)\n${output.slice(-VERIFY_LIMIT)}` : output }
+  } catch (error) {
+    return { code: null, output: `(could not run: ${String(error)})` }
   }
 }
 
@@ -148,6 +161,10 @@ export const register: Register = (on, options) => {
             type: 'boolean',
             description: "Continue cmdc's previous session (it keeps its context) — use for review fixes.",
           },
+          verify: {
+            type: 'string',
+            description: 'Shell command run in `cwd` after cmdc finishes (e.g. `npm test`); its exit code and output tail go in the report.',
+          },
         },
         required: ['task'],
       },
@@ -197,6 +214,7 @@ export const register: Register = (on, options) => {
     const input = e as unknown as Input
     const task = typeof input.task === 'string' ? input.task.trim() : ''
     if (!task) return { deny: 'task is required.' }
+    const verifyCommand = typeof input.verify === 'string' ? input.verify.trim() : ''
     if (current) return { deny: 'A cmdc run is already in progress; wait for it or stop it in the pane.' }
 
     const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : await $.session.cwd()
@@ -301,6 +319,9 @@ export const register: Register = (on, options) => {
     $.ui.status(undefined)
     $.ui.toast(`cmdc ${status}`)
 
+    const check = verifyCommand && !wasStopped ? await verify($, cwd, verifyCommand) : undefined
+    if (check) await append($, [`${check.code === 0 ? '✓' : '✗'} verify ${verifyCommand} (exit ${check.code ?? 'none'})`])
+
     const after = await snapshot($, cwd)
     const range = before && after ? [before, after] : []
     const [statusShort, stat, diff] = await Promise.all([
@@ -321,6 +342,9 @@ export const register: Register = (on, options) => {
       "## cmdc's own summary (verify, don't trust)",
       finalText?.trim() || '(none)',
       ...(ok ? [] : ['', '## stderr (tail)', stderr.trim() || '(empty)']),
+      ...(check
+        ? ['', `## verify: ${verifyCommand} (${check.code === 0 ? 'passed' : `failed, exit ${check.code ?? 'none'}`})`, check.output || '(no output)']
+        : ['', '## verify', "(none given: run the checks yourself, and pass `verify` next time)"]),
       '',
       '## git status --short',
       statusShort.trim() || '(clean)',
@@ -331,7 +355,7 @@ export const register: Register = (on, options) => {
       '## git diff',
       clip(diff, DIFF_LIMIT) || '(empty)',
       '',
-      'Now review this against your instructions. If anything is off, call again with resume: true and a precise fix list.',
+      'Now review this against your instructions in one step. If anything is off, call again with resume: true and a precise fix list.',
     ].join('\n')
 
     return { result: report }
